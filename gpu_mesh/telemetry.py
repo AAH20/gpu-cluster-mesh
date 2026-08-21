@@ -4,8 +4,10 @@ from .coordinator import ElasticCommunicator
 
 class ClusterHealthTelemetry:
     """
-    Exports real-time RDMA interconnect latency heatmaps and training goodput
-    efficiency metrics directly into A2Z SOC for sovereign cluster FinOps.
+    Computes a health/membership summary dict from an ElasticCommunicator's
+    current in-memory state. Returns a plain dict — it does not export,
+    transmit, or attest anything; wire the returned dict into whatever
+    metrics/monitoring pipeline you actually use.
     """
     def __init__(self, coordinator: ElasticCommunicator):
         self.coordinator = coordinator
@@ -14,16 +16,15 @@ class ClusterHealthTelemetry:
         ring = self.coordinator.get_active_ring()
         total_nodes = len(self.coordinator.nodes)
         healthy_nodes = ring.quorum_size
-        
+
         cluster_goodput_efficiency = (healthy_nodes / max(total_nodes, 1)) * 100.0
-        avg_rdma_latency = sum(n.rdma_link_latency_us for n in self.coordinator.nodes.values()) / max(total_nodes, 1)
+        avg_heartbeat_latency = sum(n.heartbeat_latency_us for n in self.coordinator.nodes.values()) / max(total_nodes, 1)
 
         return {
             "cluster_topology_version": ring.topology_version,
             "total_cluster_nodes": total_nodes,
             "active_quorum_nodes": healthy_nodes,
             "training_goodput_efficiency_pct": round(cluster_goodput_efficiency, 2),
-            "average_rdma_latency_us": round(avg_rdma_latency, 2),
+            "average_heartbeat_latency_us": round(avg_heartbeat_latency, 2),
             "total_hot_reconfigs": len(self.coordinator.eviction_history),
-            "a2z_soc_compliance_attestation": "VALID_HARDWARE_ATTESTATION"
         }

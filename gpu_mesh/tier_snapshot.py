@@ -13,9 +13,16 @@ class SnapshotFrame:
 
 class MultiTierGradientWAL:
     """
-    In-Memory Host-RAM & Local NVMe Multi-Tier State Mirror.
-    Stores synchronous sub-15ms gradient checkpoints in host memory,
-    eliminating the 45-minute cloud storage reload bottleneck during recovery.
+    In-memory two-tier ring buffer for gradient/optimizer-state checkpoint
+    metadata. Recent steps live in a dict (tagged "L1_HOST_RAM"); once the
+    buffer exceeds max_in_memory_frames, the oldest step is moved to a list
+    (tagged "L2_LOCAL_NVME").
+
+    Both tiers are ordinary Python objects in the same process's memory —
+    nothing here writes to real host RAM as a separate resource, NVMe, or
+    cloud storage. The tier labels describe the intended real-storage target
+    of a caller-provided writer; this class only tracks which step is where
+    and evicts in FIFO order.
     """
     def __init__(self, max_in_memory_frames: int = 5):
         self.max_in_memory_frames = max_in_memory_frames

@@ -1,85 +1,112 @@
 # GPU-Cluster-Mesh (`gpu-cluster-mesh`)
 
-**Zero-Restart Elastic RDMA Partition Arbiter & Multi-Tier Gradient Resumption Mesh for High-Scale GPU Clusters (NCCL / PyTorch FSDP2 / Megatron-LM).**
+**An in-memory simulation of heartbeat-based cluster membership and tiered gradient-checkpoint bookkeeping for distributed training coordination logic.**
 
-[![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
-[![Zero-Job-Restart](https://img.shields.io/badge/Elastic%20Reconfig-<15ms%20Hot--Swap-success.svg)]()
-[![Tests](https://img.shields.io/badge/Tests-Passed%20(4%2F4)-brightgreen.svg)]()
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 ---
 
-## 1. The Distributed GPU Cluster Outage Crisis
+## What this actually is
 
-In large-scale AI training and inference clusters (1,000 to 10,000+ H100/H200/B200 GPUs):
+Large-scale distributed training clusters need to decide, quickly, which
+nodes are still healthy and rebuild their communication topology around the
+survivors when one drops. `gpu-cluster-mesh` implements that *decision
+logic* — heartbeat tracking, timeout-based eviction, topology versioning,
+and a tiered checkpoint eviction buffer — as plain, testable, in-memory
+Python.
 
-* **NCCL Collective Deadlocks:** A single transceiver drop or 50ms RDMA packet partition stalls the entire global `all-reduce` ring, leaving 1,023 other GPUs idle and burning $35,000/hour.
-* **The 45-Minute Checkpoint IO Bottleneck:** Standard recovery requires killing the entire 1,024-node cluster job and reloading 400 GB model weights from cloud storage.
-* **Financial Waste:** Frontier model training runs suffer $250k–$800k in burned compute monthly due to uncoordinated cluster restarts.
+- `ElasticCommunicator` — tracks per-node heartbeats; `scan_and_reconfigure()`
+  evicts any node that misses its deadline and bumps a topology version
+  counter.
+- `MultiTierGradientWAL` — a bounded in-memory ring buffer for checkpoint
+  metadata. Recent steps are tagged `"L1_HOST_RAM"`; once the buffer is
+  full, the oldest step is moved to a list tagged `"L2_LOCAL_NVME"`.
+- `ClusterHealthTelemetry` — computes a summary dict (topology version,
+  quorum size, goodput %) from an `ElasticCommunicator`'s current state.
 
----
+## What this is not
 
-## 2. The Systems Solution: `gpu-cluster-mesh`
+**This package has no NCCL, RDMA, CUDA, or PyTorch dependency, and none of
+its code talks to real GPU or network hardware.** It is a model of the
+membership/eviction/versioning decisions a real elastic-training
+coordinator has to make, so that decision logic can be built and unit
+tested independently of a real cluster. Specifically:
 
-`GPU-Cluster-Mesh` provides an elastic, fault-tolerant coordination layer for distributed GPU clusters:
+- `ElasticCommunicator` does not create, rebuild, or touch an NCCL
+  communicator or process group. It decides *which nodes should be in the
+  ring* based on heartbeats you feed it; wiring that decision into an
+  actual `torch.distributed`/NCCL rebuild is left to the caller.
+- `heartbeat_latency_us` on `ClusterNode` is a value you pass in via
+  `register_heartbeat()`, not a measured RDMA/InfiniBand link latency.
+- The `"L1_HOST_RAM"` / `"L2_LOCAL_NVME"` tier labels describe intended
+  targets for a caller-provided writer. Nothing here performs actual RAM,
+  NVMe, or cloud-storage I/O — both tiers are ordinary Python objects in
+  the same process.
+- No dollar-cost or outage-frequency figures are claimed anywhere in this
+  README, because nothing in this package measures them.
 
-* **Elastic Communicator Hot-Rebuilding:** Detects degraded RDMA links and dynamically evicts dead nodes from the NCCL communication ring in **$< 15\text{ms}$ without restarting Python processes or jobs.**
-* **In-Memory Multi-Tier Gradient WAL:** Mirrors optimizer state and gradient norms to local Host RAM across PCIe Gen5 in 12ms, enabling instant sub-second local recovery.
-* **A2Z SOC FinOps Telemetry:** Streams real-time RDMA latency heatmaps, topology versions, and cluster goodput efficiency directly to **[A2Z SOC (a2zsoc.com)](https://a2zsoc.com)**.
+If you're building real elastic-training fault tolerance, use this as the
+membership state machine underneath your own NCCL/RDMA integration — not as
+a replacement for it.
 
----
+## Install
 
-## 3. Quickstart
+Not published to PyPI. Install from source:
 
-### Installation
 ```bash
-pip install gpu-cluster-mesh
+git clone https://github.com/AAH20/gpu-cluster-mesh.git
+cd gpu-cluster-mesh
+pip install -e .
 ```
 
-### Usage
+## Usage
+
 ```python
 from gpu_mesh import ElasticCommunicator, ClusterNode, MultiTierGradientWAL
 
-# 1. Initialize 128-GPU Cluster Communicator
 nodes = [ClusterNode(node_id=i, hostname=f"node-{i:02d}", gpu_indices=list(range(8))) for i in range(16)]
 communicator = ElasticCommunicator(nodes, heartbeat_timeout_s=0.5)
 
-# 2. Record Step Gradient Checkpoint in Sub-15ms Host-RAM
-wal = MultiTierGradientWAL()
-wal.record_step_gradient(step_id=1024, state_hash="sha256_hash", grad_norm=0.48)
+# Nodes report in; anything that doesn't gets evicted on the next scan
+communicator.register_heartbeat(node_id=0, latency_us=2.1)
 
-# 3. Dynamic Partition Eviction & Hot-Swap (Zero Job Restart)
 new_ring = communicator.scan_and_reconfigure()
-print(f"Active Quorum Size: {new_ring.quorum_size} GPUs (Topology v{new_ring.topology_version})")
+if new_ring:
+    print(f"Active nodes: {new_ring.quorum_size} (topology v{new_ring.topology_version})")
+    # Wire new_ring.active_node_ids into your own NCCL rebuild here.
+
+wal = MultiTierGradientWAL(max_in_memory_frames=5)
+wal.record_step_gradient(step_id=1024, state_hash="sha256_hash", grad_norm=0.48)
 ```
 
----
+## Tests
 
-## 4. Architecture
+```bash
+python -m unittest discover tests -v
+```
+
+5/5 pass locally on Python 3.10–3.12 (`.github/workflows/ci.yml` runs the
+same command on push once enabled on GitHub).
+
+## Architecture
 
 ```
 gpu-cluster-mesh/
-├── cpp/
-│   └── nccl_elastic_mock.cpp  # Native C++ collective ring reconfiguration engine
 ├── gpu_mesh/
-│   ├── __init__.py            # Clean unified exports
-│   ├── coordinator.py         # ElasticCommunicator & zero-restart ring hot-rebuilder
-│   ├── tier_snapshot.py       # Multi-Tier Host-RAM & Local NVMe Gradient WAL
-│   └── telemetry.py           # Training goodput efficiency & RDMA health exporter
+│   ├── __init__.py            # exports
+│   ├── coordinator.py         # ElasticCommunicator, ClusterNode, RingState
+│   ├── tier_snapshot.py       # MultiTierGradientWAL, SnapshotFrame
+│   └── telemetry.py           # ClusterHealthTelemetry
 └── tests/
-    └── test_gpu_mesh.py       # Verified test suite (Partition detection, hot-swap, WAL recovery)
+    └── test_gpu_mesh.py
 ```
 
----
+## License
 
-## 5. Commercial Integration with A2Z SOC
+Apache-2.0
 
-`GPU-Cluster-Mesh` streams cluster topology events, InfiniBand link integrity metrics, and hardware fault attestations directly into **[A2Z SOC (a2zsoc.com)](https://a2zsoc.com)** for sovereign AI cluster governance, SRE monitoring, and compute cost optimization.
+## Author
 
----
-
-## 6. Author
-
-**Ahmed Hassan**  
-*Principal AI Systems Architect | Founder, A2Z SOC*  
-* LinkedIn: [Ahmed Hassan](https://eg.linkedin.com/in/ahmed-hassan-f11)  
+**Ahmed Hassan**
+* LinkedIn: [Ahmed Hassan](https://eg.linkedin.com/in/ahmed-hassan-f11)
 * Platform: [A2Z SOC](https://a2zsoc.com)

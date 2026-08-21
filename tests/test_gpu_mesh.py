@@ -54,10 +54,24 @@ class TestGPUClusterMesh(unittest.TestCase):
     def test_telemetry_goodput_export(self):
         telemetry = ClusterHealthTelemetry(self.communicator)
         digest = telemetry.export_telemetry_digest()
-        
+
         self.assertEqual(digest["total_cluster_nodes"], 16)
         self.assertEqual(digest["training_goodput_efficiency_pct"], 100.0)
-        self.assertIn("a2z_soc_compliance_attestation", digest)
+        self.assertIn("average_heartbeat_latency_us", digest)
+
+    def test_telemetry_reflects_eviction(self):
+        time.sleep(0.12)
+        for i in range(16):
+            if i != 3:
+                self.communicator.register_heartbeat(i, latency_us=2.1)
+        self.communicator.scan_and_reconfigure()
+
+        telemetry = ClusterHealthTelemetry(self.communicator)
+        digest = telemetry.export_telemetry_digest()
+
+        self.assertEqual(digest["active_quorum_nodes"], 15)
+        self.assertEqual(digest["total_hot_reconfigs"], 1)
+        self.assertLess(digest["training_goodput_efficiency_pct"], 100.0)
 
 if __name__ == "__main__":
     unittest.main()

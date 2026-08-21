@@ -1,6 +1,6 @@
 import time
 import threading
-from typing import List, Dict, Optional, Set
+from typing import Any, List, Dict, Optional
 from dataclasses import dataclass, field
 
 @dataclass
@@ -10,7 +10,9 @@ class ClusterNode:
     gpu_indices: List[int]
     is_healthy: bool = True
     last_heartbeat: float = field(default_factory=time.time)
-    rdma_link_latency_us: float = 2.5 # Microsecond RDMA interconnect latency
+    # Caller-supplied value passed to register_heartbeat(); this class does
+    # not measure RDMA/network latency itself.
+    heartbeat_latency_us: float = 2.5
 
 @dataclass
 class RingState:
@@ -20,9 +22,15 @@ class RingState:
 
 class ElasticCommunicator:
     """
-    Zero-Restart Dynamic NCCL Collective Ring Reconfigurator.
-    Intercepts RDMA packet loss, isolates failing nodes in < 15ms, and
-    reconstructs PyTorch/NCCL communication rings in-flight without process restarts.
+    In-memory cluster membership tracker. Tracks node health via
+    application-level heartbeats and evicts a node once it misses its
+    heartbeat deadline, bumping a topology version counter.
+
+    This models the membership decision a real NCCL/RDMA ring rebuild would
+    act on. It does not call NCCL, use RDMA verbs, or touch any GPU or
+    network hardware — there is no PyTorch or CUDA dependency in this
+    package at all. Wire scan_and_reconfigure()'s output into your own
+    NCCL process-group rebuild logic if you need the real thing.
     """
     def __init__(self, initial_nodes: List[ClusterNode], heartbeat_timeout_s: float = 0.5):
         self.nodes: Dict[int, ClusterNode] = {n.node_id: n for n in initial_nodes}
@@ -45,13 +53,16 @@ class ElasticCommunicator:
             if node_id in self.nodes:
                 node = self.nodes[node_id]
                 node.last_heartbeat = time.time()
-                node.rdma_link_latency_us = latency_us
+                node.heartbeat_latency_us = latency_us
                 node.is_healthy = True
 
     def scan_and_reconfigure(self) -> Optional[RingState]:
         """
-        Scans for partitioned/degraded GPU nodes. If any node misses heartbeat
-        or exhibits link failure, it evicts the node and hot-rebuilds the NCCL ring.
+        Evicts any node that has missed its heartbeat deadline and bumps the
+        topology version. Returns the new RingState, or None if nothing
+        changed. Callers are responsible for acting on the eviction (e.g.
+        actually rebuilding an NCCL communicator) — this method only updates
+        in-memory membership state.
         """
         now = time.time()
         evicted = []
@@ -69,7 +80,7 @@ class ElasticCommunicator:
                     "new_topology_version": self.topology_version,
                     "timestamp": now
                 })
-                print(f"[NCCL ELASTIC RECONFIG] Evicted failed nodes {evicted}. Hot-swapped ring to v{self.topology_version} (Active GPUs: {len(active_ids)}). Zero process restarts!")
+                print(f"[gpu_mesh] Evicted nodes {evicted}. Topology bumped to v{self.topology_version} (active nodes: {len(active_ids)}).")
                 return RingState(
                     active_node_ids=sorted(active_ids),
                     topology_version=self.topology_version,
